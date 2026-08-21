@@ -1,0 +1,770 @@
+---
+output: pdf_document
+header-includes: 
+  - \pagenumbering{gobble}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Libraries, warning=F, message=F,include=F}
+library(dplyr) # Data manipulation
+library(tidyverse) # Data Manipulation
+library(e1071) # Machine Learning Utilities
+library(caret) # Machine Learning
+library(tidymodels) # Machine Learning
+library(kernlab) # SVM
+library(keras3) # MLP
+library(glmnet) # GLM for Logit
+library(randomForest) # Random Forest
+library(xgboost) # Extreme gradient boosting
+library(smotefamily) # SMOTE
+library(ggplot2) # Visualization
+library(GGally)  # Visualization
+library(gridExtra) # Visualization
+library(RSNNS) # MLP again
+library(finetune) # Tuning
+library(nestedcv) # Tuning
+library(readr)
+library(pdp) # Partial Dependence Plots
+library(vip) # Feature importance
+```
+
+# Exercise 2: Comprehensive Classification
+
+## 1. EDA and Feature Engineering
+
+### a.
+
+```{r E2Load}
+# Loading data
+setwd("C:/Users/nickz/Desktop/Fall 2025/STAT 747/Homework/Homework 4")
+df <- read.csv("financial_transactions.csv")
+df$Fraud <- as.factor(df$Fraud)
+```
+
+```{r E2_Class Distribution}
+tab<-table(df$Fraud) 
+tab<- rbind(tab,prop.table(tab)) # Table for counts and proportions of labels
+rownames(tab)<-c("Count","Proportion")
+colnames(tab)<-c("NotFraud_0","Fraud_1")
+
+cat("Counts of class labels where 1 signifies fraud and 0 signifies no fraud\n")
+print(tab)
+
+ggplot(df, aes(x = Fraud)) +
+  geom_bar() +
+  ggtitle("Class Distribution")
+```
+
+We can see that the cases are rather unbalanced with the not-fraud data points having nearly 4 times the number of observations as the fraud data points.
+
+Here are the summary statistics for the independent (all continuous) variables.
+
+```{r E2_Summary_Stats}
+num_vars <- df %>% select(where(is.numeric)) #only numeric columns (just factors)
+summary_stats <- data.frame(
+  mean = sapply(num_vars, mean),
+  sd   = sapply(num_vars, sd),
+  median = sapply(num_vars, median),
+  IQR = sapply(num_vars, IQR)
+)
+print(summary_stats)
+```
+
+
+```{r E2_Corr}
+# Correlation matrix
+cor_mat <- cor(num_vars, use = "pairwise.complete.obs")
+
+# Heatmap
+ggcorr(cor_mat, label = F)
+```
+
+Although this heatmap may be difficult to read because of overlapping labels, it is noticable that all boxes are a light pink, signifying that there is little-to-no correlation between any of the independent variables.
+
+
+### b.
+
+We can conclude from our findings in a. that no interactions terms are necessary.
+
+Here are histograms of the factors:
+
+```{r E2_Hist}
+num_names <- names(num_vars)
+plots <- lapply(num_names, function(v){ # Creating histograms
+  ggplot(num_vars, aes(x=num_vars[,v])) +
+    geom_density(fill = "skyblue", color = "blue", alpha = 0.7) +
+    labs(title=paste(v, "density plot"),
+         x = "Value",
+         y = "Density") +
+    xlim(-5,5) +
+  theme_minimal()
+})
+
+for (i in 1:10){ # Printing histograms
+  grid.arrange(grobs=plots[(5*i-4):(i*5)], ncol=2)
+}
+```
+
+We can see that all factors are relatively normally distributed and centered around 5.  There is really not much need for transformations, but as a means of preprocessing, we centered the data about their means and scale the data by their standard deviations for each independent variable.
+```{r E2_PreProc}
+df.raw <- df # Saving raw data
+
+# Transforming data by centering and scaling the independent variable columns
+df <- cbind.data.frame(Fraud=df$Fraud,
+                       scale_data_frame(num_vars, center = T, scale = T))
+```
+
+
+### c.
+
+```{r E2_part}
+# Applying SMOTE using 5 NN to synthetically generate additional data points for 
+# fraud class 1.
+df.smote <- SMOTE(df[,-1], df[,1])
+df_smoted <- df.smote$data
+df_smoted$class <- as.factor(df_smoted$class)
+```
+
+
+## 2. Model Specification & Training
+
+### a. 
+
+```{r E22a,message=F,warning=F}
+# Easier format of data for some machines' training functions
+x <- model.matrix(class ~ ., df_smoted)[, -1]
+y <- df_smoted$class
+
+# Logistic Regression
+cv_logit <- cv.glmnet(x, y, family = "binomial", alpha = 1)
+
+# Random Forest
+rf_model <- randomForest(class ~ ., data = df_smoted,
+                         ntree = 500, mtry = floor(sqrt(ncol(df_smoted)-1)))
+
+# Gradient Boosting Machine
+dtrain <- xgb.DMatrix(data = x, label = as.numeric(y)-1) # formatting for GBM
+params <- list( # parameter list for GBM
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.1, max_depth = 5
+)
+xgb_model <- xgb.train(params, dtrain, nrounds = 300) # Fitting model
+
+# SVM
+svm_model <- svm(class ~ ., data = df_smoted, kernel = "radial", cost = 1,
+                 gamma = 0.01)
+```
+
+
+### b.
+
+```{r MLP,message=F,warning=F}
+mlp_model <- caret::train(x=x,
+              y=y,
+              method="mlpML")
+```
+
+
+### c.
+
+#### Logistic Regression:
+
+Logistic regression can be formulated as:
+
+For a binary outcome $y_i \in \{0,1\}:$
+
+$$p_i = \Pr(y_i = 1 \mid x_i) = \frac{1}{1 + \exp(-x_i^\top \beta)}$$
+
+We have the negative log likelihood
+
+$$\ell(\beta) = -\sum_{i=1}^n \left[ y_i \log(p_i) + (1 - y_i)\log(1 - p_i) \right]$$
+
+
+$$\min_{\beta} \;\; \ell(\beta)\;+\;\lambda \left[ (1 - \alpha)\frac{1}{2}\lVert \beta \rVert_2^2 + \alpha \lVert \beta \rVert_1 \right]$$
+
+Where the tuning parameter $\lambda \ge 0$ controls regularization strength, and $\alpha \in [0,1]$ controls the type of regularization ($\alpha=0$: Ridge (L2), $\alpha=1$: Lass(L1). $0<\alpha<1$: Elastic Net (L1+L2)).
+
+
+#### Random forest:
+
+Each tree is trained on a bootstrap sample and each split only considers a random subset of predictors. If we call
+
+$$\hat{y}^{(b)}(x) = \text{prediction from tree } b,$$
+
+Then RF is the majority vote
+
+$$\hat{y}(x) = \operatorname{mode}\left\{\hat{y}^{(1)}(x),\,\hat{y}^{(2)}(x),\,\dots,\,\hat{y}^{(B)}(x)\right\}.$$
+
+For m features randomly selected at each split from the full set of p features,
+
+$$m \le p, \qquad \mathcal{M}_{\text{split}} \subseteq \{1,\dots,p\},\quad |\mathcal{M}_{\text{split}}| = m$$
+
+The split is chosen by impurity via Gini index
+
+$$\theta^\ast = \arg\min_{\theta \in \mathcal{M}_{\text{split}}} \; \text{Gini}(\theta).$$
+
+Such that
+
+$$\text{Gini}(t)= \sum_{k=1}^{K} p_{k}(t)\,\bigl(1 - p_{k}(t)\bigr).$$
+
+Where $p_k(t)$ is the proportion of class k in node t.
+
+The tuning parameters for RF classification are the number of trees (B or M), the number of variables at each split(m), the leaf size (minimum node size $n_{\min}$), maximum tree depth ($d_{\max}$), and sample size per tree for each bootstrap sample ($b_{\text{boot}}$).
+
+# Gradient Boosting:
+
+Gradient boosting builds a classifier by sequentially adding weak learner decision trees such that,
+
+$$F_M(x) = \sum_{m=1}^M \nu\, f_m(x)$$
+
+where,
+$f_m(x)$ is a decision tree at iteration m, $\nu\in(0,1]$ is the learning rate, and M is the number of iterations/trees.
+
+In the binary case, the predicted probability for class 1 is 
+
+$$p(x) = \frac{1}{1 + e^{-F_M(x)}}.$$
+
+The GBM minimizes logistic loss, which can be written as
+
+$$L = \sum_{i=1}^n \log \left( 1 + e^{-y_i F(x_i)} \right)$$
+
+where $y_i$ is coded such that $y_i \in\{-1,+1\}$
+
+Each iteration fits a tree to the negative gradient using pseudo-residuals such that
+
+
+$$r_{im} = -\frac{\partial L}{\partial F_{m-1}(x_i)}, $$
+
+Which, for logistic loss is:
+
+$$r_{im} = y_i - p_{m-1}(x_i).$$
+
+Then a regression tree $f_m(x)$ is fit to these residuals and the model is updated such that
+
+$$F_m(x) = F_{m-1}(x) + \nu\, f_m(x)$$
+
+The tuning parameters are the number of boosting iterations/weak learner trees M, the learning rate $0<\nu<1$, the tree depth $d_{\max}$, the minimum observations per leaf, the fraction of bag sampled, and the type and strength of regularization which is controlled by $\lambda$ and $\alpha$ like in logistic regression.
+
+
+#### SVM:
+
+From homework 2, the dual formulation of SVM for binary classification is 
+$$\underset{\alpha}{\max} \quad \sum\limits_{i=1}^n \alpha_i - \frac{1}{2} \sum\limits_{i=1}^n \sum\limits_{j=1}^n \alpha_i \alpha_j y_i y_j x_i^\intercal x_j$$
+
+$$ \text{s.t.} \quad 0 \le \alpha_i \le C, \quad i \in [n]$$
+
+$$ \sum\limits_{i=1}^n \alpha_i y_i = 0$$
+
+The Lagrange multipliers $\alpha_i$ are associated with margin constraints in that they measure the influence of training point $i$ on the optimal hyperplane. The Karush-Kuhn-Tucker conditions we derived imply three non-linearly separable cases based on these conditions:
+
+$$\alpha_i=0 \Rightarrow y_i(w^\intercal x_i + b) \ge 1 \quad \text{and} \quad \xi_i=0 \quad \quad \quad \quad(1)$$
+$$ 0 < \alpha_i < C \Rightarrow y_i(w^\intercal x_i + b) = 1 \quad \text{and} \quad \xi_i=0 \quad \quad (2)$$
+$$ \alpha_i=C \Rightarrow y_i(w^\intercal x_i + b) \le 1 \quad \text{and} \quad \xi_i \ge 0  \quad \quad \quad \:\:\:\: (3)$$
+
+
+Only points with $\alpha_i>0$ contribute to the weight vector $w = \sum\limits_{i=1}^n \alpha_i y_i x_i$; these are the support vectors.
+
+
+#### MLP:
+
+For neural networks like MLP, the parameters are
+The q p-dimensional projection vectors $\beta_1,\dots,\beta_q$.
+The q scalars $\beta_{01,\dots},\beta_{0q}$ known as shifts.
+The q coefficient scalars for terms $\gamma_1,\dots,\gamma_q$.
+The intercept $\gamma_0$.
+
+Where the the weights w are degined as $w=\{\beta_j,\gamma_j,\beta_{0j},\gamma_0\}$, and the output is referred to as $\text{net}(x,w)=\mu(x)=\phi(\eta(x))$.
+
+Sequentially, each node j of the hidden layer computes the linear combination $h_j$ given a p-dimensional input vector $x=(x_1,x_2,\dots,x_p)^\intercal$,
+
+$$h_j(x)=\beta_{0j}+\beta_{1j}x_1+\beta_{2j}x_2+\dots+\beta_{1p}xp$$
+
+Then,  that linear combination is passed through an activation function $\psi(\cdot)$, which in the case of MLP is usually a sigmoidal function $\sigma(\cdot)$.
+
+$$z_j=\psi(h_j(x))=\psi\big(\beta_{0j}+\sum\limits_{\ell=1}^p \beta_{\ell j} x_{\ell} \big)$$
+
+These $z_j$ values are combined linearly with q real coefficients $\gamma_1,\dots,\gamma_q$ and the intercept term $\gamma_0$ is added such that
+
+$$\eta(x)=\gamma_0+\sum\limits_{j=1}^q \gamma_j \psi \big(\beta_{0j}+\sum\limits_{\ell=1}^p \beta_{\ell j} x_{\ell} \big)$$
+
+Then, the value $\eta(x)$ is passed to the output layer using the output activation function (also usually a sigmoidal function, but this depends on the particular classification; in the case of this data using 0 and 1 as labels, the heaviside step function could be used, but factor coding is arbitrary as long as the output is interpretable).
+
+$$\mu(x)=\phi(\eta(x))=\phi\big(\gamma_0+\sum\limits_{j=1}^q \gamma_j \psi \big(\beta_{0j}+x^\intercal \beta_j)\big)$$
+
+Tuning parameters are number of hidden layers L, neurons per layer $h_{\ell}$, the activation function $\psi$.  Additionally, for loss-oriented training, sometimes a learning rate ($\nu$ or $\eta$) is specified, as well as regularization penalty $\lambda$, a parameter for batch size (number of samples to work through before updating internal model parameters (one forward and one backward pass of the neural network)), and number of epochs (number of times the entire dataset has to be worked through the learning algorithm).
+
+
+## 3. Model Selection & Tuning
+
+### a.
+
+```{r,message=F,warning=F}
+# Training and tuning were taking too long to be viable, so here I am reducing
+# the training dataset to a class-balanced 2000 observations and the testing
+# set to a class-balanced 250 observations.
+
+set.seed(747)
+
+train.test_split <- initial_split(df_smoted)
+train <- training(train.test_split)
+test <- testing(train.test_split)
+
+train. <- train %>% group_by(class) %>% sample_n(1000)
+test. <- test %>% group_by(class) %>% sample_n(250)
+
+# Easier format of data for some machines' training functions
+x <- model.matrix(class ~ ., train.)[, -1]
+y <- train.$class
+
+
+logit_cv <- nestcv.glmnet(y=y,
+              x=x,
+              family = "binomial",
+              outer_method = "cv",
+              n_outer_folds = 5,
+              n_inner_folds = 10,
+              alphaSet = seq(0.1,1,0.1),
+              outer_train_predict = TRUE,
+              cv.cores = 5,
+              keep = TRUE,
+              finalCV = TRUE)
+
+
+
+y_tr <- factor(ifelse(as.numeric(y)-1==1,"Fraud","NotFraud"))
+
+rf_cv <- nestcv.train(x=x,
+              y=y_tr,
+              method="rf",
+              outer_method = "cv",
+              n_outer_folds = 5,
+              n_inner_folds = 10,
+              outer_train_predict = TRUE,
+              savePredictions = "final",
+              finalCV = TRUE
+              )
+
+gbm_cv <- nestcv.train(x=x,
+              y=y_tr,
+              method="xgbTree",
+              outer_method = "cv",
+              n_outer_folds = 5,
+              n_inner_folds = 10,
+              outer_train_predict = TRUE,
+              savePredictions = "final",
+              keep = TRUE,
+              finalCV = TRUE
+              )
+
+svm_cv <- nestcv.train(x=as.matrix(x),
+              y=y_tr,
+              method="svmRadial",
+              outer_method = "cv",
+              n_outer_folds = 3,
+              outer_train_predict = TRUE,
+              finalCV = TRUE,
+              savePredictions = "final",
+              keep = TRUE,
+              type = "C-svc",
+              trControl = trainControl(number = 5,
+                                       method = "cv",
+                                       classProbs = TRUE,
+                                       summaryFunction = twoClassSummary,
+                                       savePredictions = "final")
+              )
+
+mlp_cv <- nestcv.train(x=x,
+              y=y_tr,
+              method="mlpML",
+              outer_method = "cv",
+              n_outer_folds = 5,
+              n_inner_folds = 10,
+              outer_train_predict = TRUE,
+              savePredictions = "final",
+              keep = TRUE,
+              finalCV = TRUE
+              )
+```
+
+
+```{r,message=F,warning=F}
+# Producing predictions on the training set for the best models and using them
+# to calculate specificity and sensitivity for part c
+logit_cv_preds<- predict(logit_cv$final_fit,
+        newx = as.matrix(test.[,-51]),type="response") %>%
+  {ifelse(. >= 0.5,1,0)} |> as.factor()
+logit_cv_preds <- cbind.data.frame(truth=test.$class,estimate=logit_cv_preds)
+
+rf_cv_preds<- predict(rf_cv$final_fit,
+        newdata = test.[,-51],type="raw") %>%
+  {ifelse(. == "Fraud",1,0)} |> as.factor()
+rf_cv_preds <- cbind.data.frame(truth=test.$class,estimate=rf_cv_preds)
+
+gbm_cv_preds<- predict(gbm_cv$final_fit,
+        newdata = test.[,-51],type="raw") %>%
+  {ifelse(. == "Fraud",1,0)} |> as.factor()
+gbm_cv_preds <- cbind.data.frame(truth=test.$class,estimate=gbm_cv_preds)
+
+svm_cv_preds<- predict(svm_cv$final_fit,
+        newdata = test.[,-51],type="raw") %>%
+  {ifelse(. == "Fraud",1,0)} |> as.factor()
+svm_cv_preds <- cbind.data.frame(truth=test.$class,estimate=svm_cv_preds)
+
+mlp_cv_preds<- predict(mlp_cv$final_fit,
+        newdata = test.[,-51],type="raw") %>%
+  {ifelse(. == "Fraud",1,0)} |> as.factor()
+mlp_cv_preds <- cbind.data.frame(truth=test.$class,estimate=mlp_cv_preds)
+
+# Data frame of sensitivities and specificities
+multi_metric_cv <- rbind.data.frame(
+  c(sens(logit_cv_preds, truth=truth, estimate = estimate)[,3],
+    spec(logit_cv_preds, truth=truth, estimate = estimate)[,3]),
+  c(sens(svm_cv_preds, truth=truth, estimate = estimate)[,3],
+    spec(svm_cv_preds, truth=truth, estimate = estimate)[,3]),
+  c(sens(rf_cv_preds, truth=truth, estimate = estimate)[,3],
+    spec(rf_cv_preds, truth=truth, estimate = estimate)[,3]),
+  c(sens(gbm_cv_preds, truth=truth, estimate = estimate)[,3],
+    spec(gbm_cv_preds, truth=truth, estimate = estimate)[,3]),
+  c(sens(mlp_cv_preds, truth=truth, estimate = estimate)[,3],
+    spec(mlp_cv_preds, truth=truth, estimate = estimate)[,3]))
+
+row.names(multi_metric_cv) <- c("Logit","SVM.RBF","RF","GBM","MLP")
+colnames(multi_metric_cv) <- c("Sensitivity","Specificity")
+
+```
+
+
+### b
+
+```{r,message=F,warning=F}
+# CV folds for Bayes setup
+folds <- vfold_cv(train., v = 5, strata = class)
+
+# Recipe setup
+rec <- recipe(class ~ ., data = train.) |> 
+  step_normalize(all_numeric_predictors())
+
+logreg_spec <- logistic_reg(
+  penalty = tune(),   # regularization strength
+  mixture = tune()    # 0 = ridge, 1 = lasso
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+svm_spec <- svm_rbf(
+  cost = tune(),
+  rbf_sigma = tune(),
+  margin = tune()
+) |> 
+  set_engine("kernlab") |> 
+  set_mode("classification")
+
+rf_spec <- rand_forest(
+  mtry  = tune(),
+  trees = tune(),
+  min_n = tune()
+) |> 
+  set_engine("ranger") |> 
+  set_mode("classification")
+
+gbm_spec <- boost_tree(
+  trees = tune(),
+  learn_rate = tune(),
+  tree_depth = tune(),
+  loss_reduction = tune(),
+  min_n = tune(),
+  sample_size = tune()
+) |> 
+  set_engine("xgboost") |> 
+  set_mode("classification")
+
+mlp_spec <- parsnip::mlp(
+  hidden_units = tune(),
+  penalty      = tune(),
+  epochs       = tune()
+) |>
+  set_engine("nnet") |>
+  set_mode("classification")
+```
+
+
+
+```{r}
+# workflows
+logreg_wf <- workflow() |> add_model(logreg_spec) |>  add_recipe(rec)
+svm_wf <- workflow() |> add_model(svm_spec) |> add_recipe(rec)
+rf_wf  <- workflow() |> add_model(rf_spec)  |> add_recipe(rec)
+gbm_wf <- workflow() |> add_model(gbm_spec) |> add_recipe(rec)
+mlp_wf <- workflow() |> add_model(mlp_spec) |> add_recipe(rec)
+
+```
+
+
+```{r}
+# control parameters for bayes tuning
+ctrl <- control_bayes(
+  verbose = TRUE,
+  no_improve = 10,   # early stop
+  save_workflow = TRUE
+)
+
+```
+
+
+
+
+```{r,message=F,warning=F}
+set.seed(747)
+
+# Bayes parameter optimization for all models
+logreg_bayes <- tune_bayes(
+  logreg_wf,
+  resamples = folds,
+  initial = 5,
+  iter = 15,
+  control = ctrl,
+  metrics = metric_set(roc_auc, sens, yardstick::spec)
+)
+
+# Best model for logit
+logreg_best <- select_best(logreg_bayes, metric = "sens")
+# Final workflow (logit)
+logreg_final_wf <- finalize_workflow(logreg_wf, logreg_best) |>  fit(train)
+
+# predictions (logit)
+logreg_preds <- logreg_final_wf |>
+  predict(test, type = "prob") |>
+  bind_cols(predict(logreg_final_wf, test)) |>
+  bind_cols(test)
+
+######### Process is repeated for other models
+
+svm_bayes <- svm_wf |>
+  tune_bayes(
+    resamples = folds,
+    initial = 5,
+    iter = 5,
+    control = ctrl,
+    metrics = metric_set(roc_auc, sens, yardstick::spec)
+  )
+
+svm_best <- select_best(svm_bayes, metric = "sens")
+svm_final_wf <- finalize_workflow(svm_wf, svm_best) |> fit(train.)
+svm_final_fit <- fit(svm_final_wf, train.)
+
+svm_preds <- svm_final_fit |>
+  predict(test., type = "prob") |>
+  bind_cols(predict(svm_final_fit, test.)) |>
+  bind_cols(test.)
+
+
+rf_params <- extract_parameter_set_dials(rf_wf) |>
+  finalize(select(train, -class))
+
+rf_bayes <- rf_wf |>
+  tune_bayes(
+    resamples = folds,
+    initial = 5,
+    iter = 5,
+    param_info = rf_params,
+    control = ctrl,
+    metrics = metric_set(roc_auc, sens, yardstick::spec)
+  )
+
+rf_best  <- select_best(rf_bayes, metric = "sens")
+rf_final_wf  <- finalize_workflow(rf_wf,  rf_best)  |> fit(train)
+
+rf_final_fit <- fit(rf_final_wf, train.)
+
+rf_preds <- rf_final_fit |>
+  predict(test., type = "prob") |>
+  bind_cols(predict(rf_final_fit, test.)) |>
+  bind_cols(test.)
+
+gbm_bayes <- gbm_wf |>
+  tune_bayes(
+    resamples = folds,
+    initial = 10,
+    iter = 10,
+    control = ctrl,
+    metrics = metric_set(roc_auc, sens, yardstick::spec)
+  )
+gbm_best <- select_best(gbm_bayes, metric = "sens")
+
+gmb_final_wf  <- finalize_workflow(gbm_wf,  gbm_best)  |> fit(train)
+
+gbm_final_fit <- fit(gmb_final_wf, train.)
+
+gbm_preds <- gbm_final_fit |>
+  predict(test., type = "prob") |>
+  bind_cols(predict(gbm_final_fit, test.)) |>
+  bind_cols(test.)
+
+mlp_bayes <- mlp_wf |>
+  tune_bayes(
+    resamples = folds,
+    initial = 5,
+    iter = 5,
+    control = ctrl,
+    metrics = metric_set(roc_auc, sens, yardstick::spec)
+  )
+mlp_best <- select_best(mlp_bayes, metric = "sens")
+mlp_final_wf <- finalize_workflow(mlp_wf, mlp_best) |> fit(train)
+
+mlp_final_fit <- fit(mlp_final_wf, train.)
+
+mlp_preds <- mlp_final_fit |>
+  predict(test., type = "prob") |>
+  bind_cols(predict(mlp_final_fit, test.)) |>
+  bind_cols(test.)
+
+```
+
+```{r,message=F,warning=F}
+# Computing sensitivy and specificity for all models tuned by bayes optimization
+multi_metric<-rbind.data.frame(c(sens(logreg_preds, truth = class, .pred_class)[,3],
+                      yardstick::spec(logreg_preds, truth = class, .pred_class)[,3]
+                      ),
+                    c(sens(svm_preds, truth = class, .pred_class)[,3],
+                      yardstick::spec(svm_preds, truth = class, .pred_class)[,3]),
+                    c(sens(rf_preds, truth = class, .pred_class)[,3],
+                      yardstick::spec(rf_preds, truth = class, .pred_class)[,3]),
+                    c(sens(gbm_preds, truth = class, .pred_class)[,3],
+                      yardstick::spec(gbm_preds, truth = class, .pred_class)[,3]),
+                    c(sens(mlp_preds, truth = class, .pred_class)[,3],
+                      yardstick::spec(mlp_preds, truth = class, .pred_class)[,3]))
+# These are sensitivity and specificity for bayes models
+
+row.names(multi_metric) <- c("Logit","SVM.RBF","RF","GBM","MLP")
+colnames(multi_metric) <- c("Sensitivity","Specificity")
+
+# Comparing CV vs Bayes for Sensitivity and Specificity
+cat("Sensitivity and Specificity for Nested-CV-Tuned Models \n")
+print(multi_metric_cv)
+cat("Sensitivity and Specificity for Bayes-Optimization-Tuned Models \n")
+print(round(multi_metric,3))
+
+```
+
+Overall, the Bayes-optimization-tuned models performed better.  I was particularly interested in model sensitivity in this situation because correctly detecting fraud is more important than correctly identifying lack of fraud.
+
+
+## 4. Uncertainty & Interpretation
+
+### a.
+The best performing model before was SVM tuned with Bayes optimization, so I used that for this section. 
+The analogue for conformal prediction intervals for classification is conformal test sets.  These are a set of labels the conformal predictor cannot reject with (here) 95% confidence.  This is formed for SVM RBF below:
+```{r,message=F,warning=F}
+library(probably)
+set.seed(746)
+# Conformance data
+cal_data <- train %>% group_by(class) %>% sample_n(250)
+
+# The predictor data for calibration
+cal_predictors <- cal_data[,-51]
+# The true outcome for calibration
+cal_outcome <- cal_data$class
+
+# Model predictions on conformal data
+cal_probs_svm<- predict(svm_final_fit,
+        new_data = cal_predictors,type="prob")$.pred_1
+
+quantile_level <- ceiling(501 * 0.95) / 500 # q hat quantile level
+
+q_hat <- quantile(cal_probs_svm, probs = quantile_level) # q hat
+
+min_prob_threshold <- 1-q_hat
+
+test_probs_svm <- predict(svm_final_fit, new_data = test.[,-51], type = "prob")
+
+
+prediction_sets_svm <- test_probs_svm %>%
+  # 1. Add a unique ID for grouping rows later
+  # Use rowid_to_column() for a robust ID creation
+  tibble::rowid_to_column("obs_id") %>%
+  
+  # 2. Convert to a long format: one row per observation-class pair
+  pivot_longer(
+    # Use a selection helper to pick only the probability columns (the numerics)
+    cols = where(is.numeric) & !obs_id, 
+    names_to = "Class_Name",
+    values_to = "Probability"
+  ) %>%
+  
+  # 3. Identify classes that belong in the prediction set
+  mutate(
+    # TRUE if P(k) > min_prob_threshold
+    is_in_set = Probability > min_prob_threshold
+  ) %>%
+  
+  # 4. Group by the original observation ID
+  group_by(obs_id) %>%
+  
+  # 5. Aggregate: create a list of class names where is_in_set is TRUE
+  summarise(
+    pred_set = list(Class_Name[is_in_set]),
+    .groups = "drop" # Drop the grouping at the end
+  ) %>%
+  
+  # 6. Pull the resulting list column
+  pull(pred_set)
+
+print(head(prediction_sets_svm))
+```
+
+
+Basically, if you repeat the entire process many times over, the crue class for a new, randomly selected observation will be contained within its prediction set $\hat{C}(x) \ge 1-\alpha = 0.95$ of the time.  Where if the true class for the prediction set was "1" and the set was ".pred_1" ".pred_2", the prediction was correct (95% conf).  If the true class was "1" and the set was ".pred_2", the prediction was incorrect.
+
+
+### b.
+
+```{r,warning=F,message=F}
+library(iml)
+# Predict function for svm model in predictor environment
+predict_function <- function(model, newdata) { 
+  prob_df <- predict(model, newdata, type = "prob")
+  return(prob_df$.pred_1)
+}
+
+# 2. Create the Predictor environment 
+# This is the object that handles all subsequent XAI methods (SHAP, LIME, PDP)
+predictor <- Predictor$new(
+  model = svm_final_fit, 
+  data = test.[,-51], 
+  y = test.$class,
+  class = "Fraud", # Specify the factor level for the positive class
+  predict.function = predict_function
+)
+
+importance <- FeatureImp$new(predictor, loss = "ce") # ce = cross-entropy loss
+X_sample <- test.[1:20,-51] # Computer could not handle a large sample
+
+# Calculate Shapley values 
+shap_calc <- Shapley$new(predictor, x.interest = X_sample, sample.size = 100) 
+
+# Feature contributions
+print(shap_calc$plot() + labs(title = "SHAP Feature Contribution Distribution"))
+
+```
+
+It may be difficult to read because all of the features are tightly packed, but here is the SHAP feature contribution distribution plot. I could not get it to space out more easily, unfortunately.
+
+
+
+```{r,message=F,warning=F}
+for (feat in c("Behavior3","Behavior5","Behavior4")) {
+  pdp_plot <- FeatureEffect$new(predictor, feature = feat, method = "pdp")
+  
+  # Plot the PDP: x-axis is feature value, y-axis is average P(Fraud)
+  print(
+    pdp_plot$plot() + 
+      labs(title = paste("Partial Dependence Plot for:", feat))
+  )
+}
+```
+
+Here are partial dependence plots from the top 3 features of the dataset.
